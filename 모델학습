@@ -1,0 +1,158 @@
+
+!pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+!pip install -q git+https://github.com/huggingface/transformers.git accelerate bitsandbytes sentencepiece safetensors pillow
+!pip install -q peft optimum pyarrow datasets requests trl
+
+import os
+import torch
+import hashlib
+from dataclasses import dataclass
+from datasets import load_dataset
+from PIL import Image
+from transformers import AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig, TrainingArguments, Trainer
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+train_path = '/content/drive/MyDrive/deeplearningchallenge/deep_chal_multitask_dataset.parquet'
+zip_path = "/content/drive/MyDrive/deeplearningchallenge/images.zip"
+
+print("="*50)
+print("압축된 이미지 캐시(images.zip)를 로컬 디스크로 복사합니다...")
+!cp {zip_path} /content/images.zip
+print("복사 완료! 기존 폴더를 삭제하고 새로 압축을 해제합니다...")
+!rm -rf /content/images
+!unzip -oq /content/images.zip -d /content/
+print("압축 해제 완료!")
+print("="*50)
+
+IMAGE_CACHE_DIR = "/content/images/images"
+
+model_id = "llava-hf/llava-1.5-7b-hf"
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16
+)
+model = LlavaForConditionalGeneration.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map="auto",
+    torch_dtype=torch.float16,
+    trust_remote_code=True
+)
+processor = AutoProcessor.from_pretrained(model_id)
+
+processor.tokenizer.padding_side = "left"
+if processor.tokenizer.pad_token is None:
+    processor.tokenizer.pad_token = processor.tokenizer.unk_token
+model.config.pad_token_id = processor.tokenizer.pad_token_id
+
+def check_image_exists(example):
+    if example.get('input_type') != 'image':
+        return True
+
+    hash_source = example.get('input')[:256] if not example.get('input').startswith('http') else example.get('input')
+    filename = hashlib.sha256(hash_source.encode()).hexdigest()
+    filepath = os.path.join(IMAGE_CACHE_DIR, filename)
+    return os.path.exists(filepath)
+
+def preprocess_final(example):
+    task = example.get('task')
+    input_text = example.get('input', "")
+    question = example.get('question', "")
+    output_text = example.get('output', "")
+    prompt_str = ""
+    if task == 'math_reasoning': prompt_str = f"Task: 수학적 추론. 문제: {input_text}\n풀이:"
+    elif task == 'text_qa': prompt_str = f"Task: 문맥 기반 질의응답. 문맥: {input_text}\n질문: {question}\n답변:"
+    elif task == 'summarization': prompt_str = f"Task: 요약. 문서: {input_text}\n요약문:"
+    elif task == 'captioning': prompt_str = f"Task: 이미지 캡셔닝. 이미지: <image>\n설명:"
+    elif task == 'vqa': prompt_str = f"Task: 시각적 질의응답. 이미지: <image>\n질문: {question}\n답변:"
+
+    example['text'] = f"{prompt_str}{output_text}{processor.tokenizer.eos_token}"
+
+    if example.get('input_type') == 'image':
+        hash_source = example.get('input')[:256] if not example.get('input').startswith('http') else example.get('input')
+        filename = hashlib.sha256(hash_source.encode()).hexdigest()
+        example['image_path'] = os.path.join(IMAGE_CACHE_DIR, filename)
+    else:
+        example['image_path'] = None
+    return example
+
+ds_train = load_dataset("parquet", data_files=train_path, split="train")
+
+print("1단계: 유효한 데이터 선별 중...")
+ds_train = ds_train.filter(check_image_exists, num_proc=2)
+
+print("2단계: 선별된 데이터 가공 중...")
+columns_to_remove = [col for col in ds_train.column_names if col != 'ID']
+
+ds_train = ds_train.map(
+    preprocess_final,
+    num_proc=2,
+    remove_columns=columns_to_remove
+)
+
+@dataclass
+class DataCollatorForLlava:
+    processor: AutoProcessor
+
+    def __call__(self, features):
+        texts = [feature['text'] for feature in features]
+        image_paths = [feature['image_path'] for feature in features]
+
+        images = []
+        for path in image_paths:
+            if path:
+                try:
+                    images.append(Image.open(path).convert("RGB"))
+                except Exception:
+                    pass
+
+        inputs = self.processor(text=texts, images=images if images else None, return_tensors="pt", padding=True)
+
+        inputs['labels'] = inputs['input_ids'].clone()
+        inputs['labels'][inputs['input_ids'] == self.processor.tokenizer.pad_token_id] = -100
+
+        return inputs
+
+lora_config = LoraConfig(
+    r=4,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = prepare_model_for_kbit_training(model)
+model = get_peft_model(model, lora_config)
+
+training_args = TrainingArguments(
+    output_dir="./llava-finetuned-final",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    num_train_epochs=3,
+    max_steps=2000,
+    fp16=True,
+    logging_steps=50,
+    save_strategy="epoch",
+    save_total_limit=1,
+    learning_rate=2e-5,
+    report_to="none",
+    remove_unused_columns=False,
+    gradient_checkpointing=True
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=ds_train,
+    data_collator=DataCollatorForLlava(processor=processor),
+)
+
+print("\n--- 최종 모델 학습을 시작합니다 ---")
+trainer.train()
+print("\n--- 모델 학습 완료 ---")
