@@ -1,0 +1,198 @@
+!pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+!pip install -q -U git+https://github.com/huggingface/transformers.git accelerate bitsandbytes sentencepiece safetensors pillow
+!pip install -q peft optimum pyarrow datasets requests pandas tqdm
+
+import os
+import torch
+import hashlib
+import base64
+import io
+import pandas as pd
+import requests
+from tqdm.auto import tqdm
+from datasets import load_dataset
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+from transformers import AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
+from peft import PeftModel
+from google.colab import drive
+
+drive.mount('/content/drive', force_remount=True)
+
+test_path = '/content/drive/MyDrive/deeplearningchallenge/deep_chal_multitask_dataset_test.parquet'
+adapter_path = "/content/drive/MyDrive/deeplearningchallenge/llava-finetuned-final/checkpoint-2000"
+
+print("학습된 모델을 로딩합니다...")
+base_model_id = "llava-hf/llava-1.5-7b-hf"
+
+# 안정적인 4-bit 로딩을 위해 BitsAndBytesConfig를 명시적으로 사용합니다.
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16
+)
+model = LlavaForConditionalGeneration.from_pretrained(
+    base_model_id,
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True
+)
+processor = AutoProcessor.from_pretrained(base_model_id)
+model = PeftModel.from_pretrained(model, adapter_path)
+print("모델 로딩 완료!")
+
+HEADERS = {'User-Agent': 'Mozilla/5.0'}
+PIXEL_LIMIT = 90000000
+MAX_DIMENSION = 1024
+
+def load_image_for_inference(data_input):
+    try:
+        if isinstance(data_input, str) and data_input.startswith('http'):
+            resp = requests.get(data_input, timeout=15, headers=HEADERS)
+            if resp.status_code != 200: return None
+            image_content = resp.content
+        else: # base64
+            if ',' in data_input: data_input = data_input.split(',')[1]
+            image_content = base64.b64decode(data_input)
+
+        image = Image.open(io.BytesIO(image_content)).convert("RGB")
+
+        if image.width * image.height > PIXEL_LIMIT:
+            image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
+
+        return image
+    except Exception:
+        return None
+
+def create_prompt_for_inference(example):
+    task = example.get('task')
+    input_text = example.get('input', "")
+    question = example.get('question', "")
+    if task == 'math_reasoning': return f"Task: 수학적 추론. 문제: {input_text}\n풀이:"
+    elif task == 'text_qa': return f"Task: 문맥 기반 질의응답. 문맥: {input_text}\n질문: {question}\n답변:"
+    elif task == 'summarization': return f"Task: 요약. 문서: {input_text}\n요약문:"
+    elif task == 'captioning': return f"Task: 이미지 캡셔닝. 이미지: <image>\n설명:"
+    elif task == 'vqa': return f"Task: 시각적 질의응답. 이미지: <image>\n질문: {question}\n답변:"
+    return ""
+
+ds_test = load_dataset("parquet", data_files=test_path, split="train")
+results = []
+BATCH_SIZE = 2 # 안정성을 위해 배치 크기를 2로 설정
+
+# --- 중간 저장 파일 경로 설정 및 기존 진행 상황 불러오기 ---
+temp_submission_path = "/content/drive/MyDrive/deeplearningchallenge/submission_temp.csv"
+start_index = 0
+
+if os.path.exists(temp_submission_path):
+    print(f"'{temp_submission_path}'에서 기존 진행 상황을 불러옵니다...")
+    try:
+        temp_df = pd.read_csv(temp_submission_path)
+        if not temp_df.empty:
+            start_index = temp_df['ID'].max() + 1
+            results = temp_df.to_dict('records')
+        print(f"{start_index}번 ID부터 추론을 다시 시작합니다.")
+    except Exception as e:
+        print(f"중간 저장 파일을 불러오는 데 실패했습니다. 처음부터 시작합니다. 오류: {e}")
+else:
+    print("새로운 추론을 시작합니다.")
+
+print(f"테스트 데이터셋 추론 시작 (배치 크기: {BATCH_SIZE})...")
+
+for i in tqdm(range(start_index, len(ds_test), BATCH_SIZE)):
+    batch_data = ds_test[i:i+BATCH_SIZE]
+
+    current_batch_size = len(list(batch_data.values())[0])
+    ids = list(range(i, i + current_batch_size))
+
+    # --- 안정성을 위한 텍스트/이미지 동시 처리 ---
+    batch_prompts, batch_images, valid_ids = [], [], []
+
+    for j in range(current_batch_size):
+        example = {key: batch_data[key][j] for key in batch_data}
+        prompt = create_prompt_for_inference(example)
+
+        if "<image>" in prompt:
+            image = load_image_for_inference(example.get("input"))
+            if image is not None:
+                batch_prompts.append(prompt)
+                batch_images.append(image)
+                valid_ids.append(ids[j])
+        else:
+            batch_prompts.append(prompt)
+            valid_ids.append(ids[j])
+
+    if not batch_prompts:
+        continue
+
+    inputs = processor(
+        text=batch_prompts,
+        images=batch_images if batch_images else None,
+        return_tensors="pt",
+        padding=True
+    ).to("cuda")
+
+    with torch.no_grad():
+        input_ids_len = inputs['input_ids'].shape[1]
+        output_ids = model.generate(**inputs, max_new_tokens=512, do_sample=False)
+        generated_ids = output_ids[:, output_ids.shape[1] - input_ids_len:]
+
+    outputs = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    for j, generated_text in enumerate(outputs):
+        results.append({'ID': valid_ids[j], 'Output': generated_text.strip()})
+
+    # --- 10번의 배치(20개)마다 중간 결과를 드라이브에 저장 ---
+    if (i // BATCH_SIZE + 1) % 10 == 0:
+        pd.DataFrame(results).to_csv(temp_submission_path, index=False)
+import re
+import csv
+
+print("추론 완료! 최종 제출 파일을 생성 및 정제합니다...")
+submission_df = pd.DataFrame(results)
+
+# --- [핵심] 최종 제출 파일 정제 로직 ---
+
+# 1. 손상된 출력을 정리하고, 빈 값은 0으로 처리하는 함수
+def sanitize_and_fill_zero(text, max_len=1024):
+    if not isinstance(text, str):
+        return 0
+    cleaned_text = re.sub(r'[\s`]+', ' ', text).strip()
+    if not cleaned_text or len(cleaned_text) > max_len:
+        return 0
+    return cleaned_text
+
+print("'Output' 컬럼을 정리하고 손상/누락된 값을 0으로 채웁니다...")
+submission_df['Output'] = submission_df['Output'].apply(sanitize_and_fill_zero)
+
+# 2. 전체 2493개 행을 보장하기 위해 ID 목록과 병합
+all_ids_df = pd.DataFrame({'ID': range(len(ds_test))})
+final_df = pd.merge(all_ids_df, submission_df, on='ID', how='left')
+final_df['Output'] = final_df['Output'].fillna(0)
+final_df = final_df.iloc[:2493]
+
+# 3. ID 컬럼 데이터 타입 및 컬럼명 변경
+final_df['ID'] = final_df['ID'].astype(int)
+final_df.columns = ["id", "output"]
+
+# --- 가장 깨끗한 방식으로 CSV 파일 수동 저장 ---
+final_csv_path = "/content/drive/MyDrive/deeplearningchallenge/submission.csv"
+
+print("가장 깨끗한 방식으로 CSV 파일을 수동으로 저장합니다...")
+with open(final_csv_path, 'w', newline='', encoding='utf-8') as f:
+    writer = csv.writer(f)
+    writer.writerow(['id', 'output'])
+    for index, row in final_df.iterrows():
+        writer.writerow([row['id'], row['output']])
+
+print("\n" + "="*50)
+print("✅ 최종 제출 파일 생성이 완료되었습니다!")
+print(f"파일 경로: {final_csv_path}")
+print("="*50)
+
+# --- 생성된 파일 검증 ---
+verify_df = pd.read_csv(final_csv_path)
+print("행 개수:", len(verify_df))
+print("Null 값 개수 (output 컬럼):", verify_df['output'].isnull().sum())
+print("\n파일 내용 미리보기 (마지막 5줄):")
+print(verify_df.tail())
